@@ -1,6 +1,10 @@
 use anyhow::{anyhow, bail, Result};
+use editor::{Editor, EditorElement, EditorStyle};
 use futures::{future::BoxFuture, stream::BoxStream, FutureExt, StreamExt};
-use gpui::{AnyView, AppContext, AsyncAppContext, ModelContext, Subscription, Task};
+use gpui::{
+    AnyView, AppContext, AsyncAppContext, FontStyle, ModelContext, Subscription, Task, TextStyle,
+    View, WhiteSpace,
+};
 use http_client::HttpClient;
 use ollama::{
     get_models, preload_model, stream_chat_completion, ChatMessage, ChatOptions, ChatRequest,
@@ -10,6 +14,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
 use std::{collections::BTreeMap, sync::Arc};
+use theme::ThemeSettings;
 use ui::{prelude::*, ButtonLike, Indicator};
 use util::ResultExt;
 
@@ -26,6 +31,7 @@ const OLLAMA_SITE: &str = "https://ollama.com/";
 
 const PROVIDER_ID: &str = "ollama";
 const PROVIDER_NAME: &str = "Ollama";
+const DEFAULT_APK_KEY: &str = "Ollama";
 
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct OllamaSettings {
@@ -55,21 +61,56 @@ pub struct State {
     available_models: Vec<ollama::Model>,
     fetch_model_task: Option<Task<Result<()>>>,
     _subscription: Subscription,
+    api_key: Option<String>,
 }
+
+const OLLAMA_API_KEY_VAR: &str = "OLLAMA_API_KEY";
 
 impl State {
     fn is_authenticated(&self) -> bool {
         !self.available_models.is_empty()
     }
 
+    fn is_api_key_set(&self) -> bool {
+        self.api_key.is_some()
+    }
+
+    fn reset_api_key(&self, cx: &mut ModelContext<Self>) -> Task<Result<()>> {
+        let settings = &AllLanguageModelSettings::get_global(cx).ollama;
+        let delete_credentials = cx.delete_credentials(&settings.api_url);
+        cx.spawn(|this, mut cx| async move {
+            delete_credentials.await.log_err();
+            this.update(&mut cx, |this, cx| {
+                this.api_key = None;
+                cx.notify();
+            })
+        })
+    }
+
+    fn set_api_key(&mut self, api_key: String, cx: &mut ModelContext<Self>) -> Task<Result<()>> {
+        let settings = &AllLanguageModelSettings::get_global(cx).ollama;
+        let write_credentials =
+            cx.write_credentials(&settings.api_url, "Bearer", api_key.as_bytes());
+
+        cx.spawn(|this, mut cx| async move {
+            write_credentials.await?;
+            this.update(&mut cx, |this, cx| {
+                this.api_key = Some(api_key);
+                cx.notify();
+            })
+        })
+    }
+
     fn fetch_models(&mut self, cx: &mut ModelContext<Self>) -> Task<Result<()>> {
         let settings = &AllLanguageModelSettings::get_global(cx).ollama;
         let http_client = self.http_client.clone();
         let api_url = settings.api_url.clone();
+        let api_key = self.api_key.clone();
 
         // As a proxy for the server being "authenticated", we'll check if its up by fetching the models
         cx.spawn(|this, mut cx| async move {
-            let models = get_models(http_client.as_ref(), &api_url, None).await?;
+            let api_key = api_key.as_deref().unwrap_or(DEFAULT_APK_KEY);
+            let models = get_models(http_client.as_ref(), &api_url, &api_key, None).await?;
 
             let mut models: Vec<ollama::Model> = models
                 .into_iter()
@@ -120,11 +161,17 @@ impl OllamaLanguageModelProvider {
                     }
                 });
 
+                let api_key = match std::env::var(OLLAMA_API_KEY_VAR) {
+                    Ok(v) => Some(v),
+                    _ => None,
+                };
+
                 State {
                     http_client,
                     available_models: Default::default(),
                     fetch_model_task: None,
                     _subscription: subscription,
+                    api_key,
                 }
             }),
         };
@@ -186,6 +233,7 @@ impl LanguageModelProvider for OllamaLanguageModelProvider {
                 Arc::new(OllamaLanguageModel {
                     id: LanguageModelId::from(model.name.clone()),
                     model: model.clone(),
+                    state: self.state.clone(),
                     http_client: self.http_client.clone(),
                     request_limiter: RateLimiter::new(4),
                 }) as Arc<dyn LanguageModel>
@@ -194,12 +242,19 @@ impl LanguageModelProvider for OllamaLanguageModelProvider {
     }
 
     fn load_model(&self, model: Arc<dyn LanguageModel>, cx: &AppContext) {
-        let settings = &AllLanguageModelSettings::get_global(cx).ollama;
         let http_client = self.http_client.clone();
-        let api_url = settings.api_url.clone();
+
+        let (api_key, api_url) = cx.read_model(&self.state, |state, cx| {
+            let settings = &AllLanguageModelSettings::get_global(cx).ollama;
+            (state.api_key.clone(), settings.api_url.clone())
+        });
+
         let id = model.id().0.to_string();
-        cx.spawn(|_| async move { preload_model(http_client, &api_url, &id).await })
-            .detach_and_log_err(cx);
+        cx.spawn(|_| async move {
+            let api_key = api_key.as_deref().unwrap_or(DEFAULT_APK_KEY);
+            preload_model(http_client, &api_url, &api_key, &id).await
+        })
+        .detach_and_log_err(cx);
     }
 
     fn is_authenticated(&self, cx: &AppContext) -> bool {
@@ -218,11 +273,20 @@ impl LanguageModelProvider for OllamaLanguageModelProvider {
     fn reset_credentials(&self, cx: &mut AppContext) -> Task<Result<()>> {
         self.state.update(cx, |state, cx| state.fetch_models(cx))
     }
+
+    fn must_accept_terms(&self, _cx: &AppContext) -> bool {
+        false
+    }
+
+    fn render_accept_terms(&self, _cx: &mut WindowContext) -> Option<gpui::AnyElement> {
+        None
+    }
 }
 
 pub struct OllamaLanguageModel {
     id: LanguageModelId,
     model: ollama::Model,
+    state: gpui::Model<State>,
     http_client: Arc<dyn HttpClient>,
     request_limiter: RateLimiter,
 }
@@ -264,15 +328,18 @@ impl OllamaLanguageModel {
         cx: &AsyncAppContext,
     ) -> BoxFuture<'static, Result<ChatResponseDelta>> {
         let http_client = self.http_client.clone();
-
-        let Ok(api_url) = cx.update(|cx| {
+        let Ok((api_key, api_url)) = cx.read_model(&self.state, |state, cx| {
             let settings = &AllLanguageModelSettings::get_global(cx).ollama;
-            settings.api_url.clone()
+            (state.api_key.clone(), settings.api_url.clone())
         }) else {
             return futures::future::ready(Err(anyhow!("App state dropped"))).boxed();
         };
 
-        async move { ollama::complete(http_client.as_ref(), &api_url, request).await }.boxed()
+        async move {
+            let api_key = api_key.as_deref().unwrap_or(DEFAULT_APK_KEY);
+            ollama::complete(http_client.as_ref(), &api_url, &api_key, request).await
+        }
+        .boxed()
     }
 }
 
@@ -326,15 +393,17 @@ impl LanguageModel for OllamaLanguageModel {
         let request = self.to_ollama_request(request);
 
         let http_client = self.http_client.clone();
-        let Ok(api_url) = cx.update(|cx| {
+        let Ok((api_key, api_url)) = cx.read_model(&self.state, |state, cx| {
             let settings = &AllLanguageModelSettings::get_global(cx).ollama;
-            settings.api_url.clone()
+            (state.api_key.clone(), settings.api_url.clone())
         }) else {
             return futures::future::ready(Err(anyhow!("App state dropped"))).boxed();
         };
 
         let future = self.request_limiter.stream(async move {
-            let response = stream_chat_completion(http_client.as_ref(), &api_url, request).await?;
+            let api_key = api_key.as_deref().unwrap_or(DEFAULT_APK_KEY);
+            let response =
+                stream_chat_completion(http_client.as_ref(), &api_url, &api_key, request).await?;
             let stream = response
                 .filter_map(|response| async move {
                     match response {
@@ -406,12 +475,19 @@ impl LanguageModel for OllamaLanguageModel {
 }
 
 struct ConfigurationView {
+    api_key_editor: View<Editor>,
     state: gpui::Model<State>,
     loading_models_task: Option<Task<()>>,
 }
 
 impl ConfigurationView {
     pub fn new(state: gpui::Model<State>, cx: &mut ViewContext<Self>) -> Self {
+        let api_key_editor = cx.new_view(|cx| {
+            let mut editor = Editor::single_line(cx);
+            editor.set_placeholder_text("key", cx);
+            editor
+        });
+
         let loading_models_task = Some(cx.spawn({
             let state = state.clone();
             |this, mut cx| async move {
@@ -430,15 +506,80 @@ impl ConfigurationView {
         }));
 
         Self {
+            api_key_editor,
             state,
             loading_models_task,
         }
+    }
+
+    fn save_api_key(&mut self, _: &menu::Confirm, cx: &mut ViewContext<Self>) {
+        let api_key = self.api_key_editor.read(cx).text(cx);
+        if api_key.is_empty() {
+            return;
+        }
+
+        let state = self.state.clone();
+        cx.spawn(|_, mut cx| async move {
+            state
+                .update(&mut cx, |state, cx| state.set_api_key(api_key, cx))?
+                .await
+        })
+        .detach_and_log_err(cx);
+
+        cx.notify();
+    }
+
+    fn reset_api_key(&mut self, cx: &mut ViewContext<Self>) {
+        self.api_key_editor
+            .update(cx, |editor, cx| editor.set_text("", cx));
+
+        let state = self.state.clone();
+        cx.spawn(|_, mut cx| async move {
+            state
+                .update(&mut cx, |state, cx| state.reset_api_key(cx))?
+                .await
+        })
+        .detach_and_log_err(cx);
+
+        cx.notify();
+    }
+
+    fn render_api_key_editor(&self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+        let settings = ThemeSettings::get_global(cx);
+        let text_style = TextStyle {
+            color: cx.theme().colors().text,
+            font_family: settings.ui_font.family.clone(),
+            font_features: settings.ui_font.features.clone(),
+            font_fallbacks: settings.ui_font.fallbacks.clone(),
+            font_size: rems(0.875).into(),
+            font_weight: settings.ui_font.weight,
+            font_style: FontStyle::Normal,
+            line_height: relative(1.3),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+            white_space: WhiteSpace::Normal,
+            truncate: None,
+        };
+        EditorElement::new(
+            &self.api_key_editor,
+            EditorStyle {
+                background: cx.theme().colors().editor_background,
+                local_player: cx.theme().players().local(),
+                text: text_style,
+                ..Default::default()
+            },
+        )
     }
 
     fn retry_connection(&self, cx: &mut WindowContext) {
         self.state
             .update(cx, |state, cx| state.fetch_models(cx))
             .detach_and_log_err(cx);
+    }
+
+    fn should_render_editor(&self, cx: &mut ViewContext<Self>) -> bool {
+        !self.state.read(cx).is_api_key_set()
     }
 }
 
@@ -458,6 +599,7 @@ impl Render for ConfigurationView {
         } else {
             v_flex()
                 .size_full()
+                .on_action(cx.listener(Self::save_api_key))
                 .gap_3()
                 .child(
                     v_flex()
@@ -466,6 +608,44 @@ impl Render for ConfigurationView {
                         .p_1()
                         .child(Label::new(ollama_intro))
                         .child(Label::new(ollama_reqs))
+                        .child(if self.should_render_editor(cx) {
+                            v_flex()
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .my_2()
+                                        .px_2()
+                                        .py_1()
+                                        .bg(cx.theme().colors().editor_background)
+                                        .rounded_md()
+                                        .child(self.render_api_key_editor(cx))
+                                )
+                                .child(
+                                    Label::new(
+                                        format!("You can also assign the {OLLAMA_API_KEY_VAR} environment variable and restart Zed."),
+                                    )
+                                    .size(LabelSize::Small),
+                                )
+                        } else {
+                            h_flex()
+                                .size_full()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(Icon::new(IconName::Check).color(Color::Success))
+                                        .child(Label::new("API key configured.".to_string())),
+                                )
+                                .child(
+                                    Button::new("reset-key", "Reset key")
+                                        .icon(Some(IconName::Trash))
+                                        .icon_size(IconSize::Small)
+                                        .icon_position(IconPosition::Start)
+                                        .on_click(
+                                            cx.listener(|this, _, cx| this.reset_api_key(cx)),
+                                        ),
+                                )
+                        })
                         .child(
                             h_flex()
                                 .gap_0p5()
